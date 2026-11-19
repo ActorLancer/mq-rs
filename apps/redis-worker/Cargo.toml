@@ -1,0 +1,24 @@
+[package]
+name = "redis-worker"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+domain = { path = "../../crates/domain" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+redis = { workspace = true }
+sqlx = { workspace = true }
+
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

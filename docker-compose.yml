@@ -1,0 +1,54 @@
+services:
+    redis:
+        image: redis:7.4
+        container_name: massage-lab-redis
+        command:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+        ports:
+            - "16379:6379"
+        volumes:
+            - redis-data:/data
+        restart: unless-stopped
+
+    nats:
+        image: nats:2.11
+        container_name: message-lab-nats
+        command:
+            - "-js"
+            - "-sd"
+            - "/data"
+            - "-m"
+            - "8222"
+        ports:
+            - "14222:4222"
+            - "18222:8222"
+        volumes:
+            - nats-data:/data
+        restart: unless-stopped
+
+    postgres:
+        image: postgres:17
+        container_name: message-lab-postgres
+        environment:
+            POSTGRES_USER: message_lab
+            POSTGRES_PASSWORD: dev_password
+            POSTGRES_DB: message_lab
+        ports:
+            - "65432:5432"
+        volumes:
+            - postgres-data:/var/lib/postgresql/data
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U message_lab -d message_lab"]
+            interval: 5s
+            timeout: 3s
+            retries: 10
+        restart: unless-stopped
+
+volumes:
+    redis-data:
+    nats-data:
+    postgres-data:
