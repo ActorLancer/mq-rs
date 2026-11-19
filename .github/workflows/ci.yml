@@ -13,6 +13,15 @@ jobs:
   check:
     runs-on: ubuntu-latest
     services:
+      redis:
+        image: redis:7.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
       postgres:
         image: postgres:17
         env:
@@ -28,6 +37,7 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://message_lab:dev_password@localhost:5432/message_lab
+      TEST_REDIS_URL: redis://127.0.0.1:6379/
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

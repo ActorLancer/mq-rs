@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let payload = serde_json::to_string(&event)?;
 
     let stream_id: String = redis::cmd("XADD")
-        .arg("orders:events")
+        .arg("orders:{events}:main")
         .arg("*")
         .arg("event_id")
         .arg(event.event_id.to_string())
@@ -51,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
         .arg(&event.event_type)
         .arg("payload")
         .arg(payload)
+        .arg("retry_count")
+        .arg("0")
         .query_async(&mut conn)
         .await
         .context("failed to publish event to Redis Stream")?;

@@ -13,6 +13,7 @@ use redis_worker::{
     migrate,
     processor::{GROUP, STREAM, process_batch},
     recovery::recover_pending,
+    retry::{self, RetryConfig},
 };
 
 const READ_BATCH_SIZE: usize = 10;
@@ -52,6 +53,42 @@ async fn main() -> anyhow::Result<()> {
         .map(|value| value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    let retry_config = RetryConfig {
+        retry_zset: env::var("RETRY_ZSET")
+            .unwrap_or_else(|_| "orders:{events}:retry".to_owned()),
+        retry_payloads: env::var("RETRY_PAYLOADS")
+            .unwrap_or_else(|_| "orders:{events}:retry:payloads".to_owned()),
+        dead_stream: env::var("DLQ_STREAM")
+            .unwrap_or_else(|_| "orders:{events}:dead".to_owned()),
+        dead_index: env::var("DLQ_INDEX")
+            .unwrap_or_else(|_| "orders:{events}:dead:index".to_owned()),
+        max_retries: parse_env("MAX_RETRIES", 5_u32)?,
+        base_delay: Duration::from_millis(parse_env("RETRY_BASE_DELAY_MS", 1_000_u64)?),
+        max_delay: Duration::from_millis(parse_env("RETRY_MAX_DELAY_MS", 60_000_u64)?),
+        scheduler_interval: Duration::from_millis(
+            parse_env("RETRY_SCHEDULER_INTERVAL_MS", 1_000_u64)?,
+        ),
+        scheduler_batch_size: parse_env("RETRY_SCHEDULER_BATCH_SIZE", 100_usize)?,
+    };
+
+    anyhow::ensure!(
+        !retry_config.base_delay.is_zero(),
+        "RETRY_BASE_DELAY_MS must be greater than zero"
+    );
+    anyhow::ensure!(
+        retry_config.max_delay >= retry_config.base_delay,
+        "RETRY_MAX_DELAY_MS must be at least RETRY_BASE_DELAY_MS"
+    );
+    anyhow::ensure!(
+        !retry_config.scheduler_interval.is_zero(),
+        "RETRY_SCHEDULER_INTERVAL_MS must be greater than zero"
+    );
+    anyhow::ensure!(
+        retry_config.scheduler_batch_size > 0,
+        "RETRY_SCHEDULER_BATCH_SIZE must be greater than zero"
+    );
+    retry::validate_hash_tags(STREAM, &retry_config)?;
+
     let redis_client = redis::Client::open(redis_url).context("failed to create Redis client")?;
 
     let pool = PgPoolOptions::new()
@@ -84,6 +121,9 @@ async fn main() -> anyhow::Result<()> {
         min_idle_ms,
         recovery_interval_secs,
         fail_before_ack,
+        max_retries = retry_config.max_retries,
+        retry_zset = %retry_config.retry_zset,
+        dead_stream = %retry_config.dead_stream,
         "redis worker starting"
     );
 
@@ -100,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
             min_idle_ms,
             recovery_interval_secs,
             fail_before_ack,
+            &retry_config,
             &shutdown,
         )
         .await
@@ -170,6 +211,7 @@ async fn run_worker(
     min_idle_ms: u64,
     recovery_interval_secs: u64,
     fail_before_ack: bool,
+    retry_config: &RetryConfig,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
     let mut read_conn = client
@@ -195,17 +237,19 @@ async fn run_worker(
         min_idle_ms,
         max_in_flight,
         fail_before_ack,
+        retry_config,
     )
     .await?;
     info!(?startup_report, "startup Pending recovery completed");
 
-    // Recovery is an independent task with its own connection. It does not
-    // cancel or reissue the long-blocking XREADGROUP operation.
+    // Recovery and retry scheduling use independent Redis connections.
     let recovery_shutdown = shutdown.child_token();
+    let retry_shutdown = shutdown.child_token();
     let recovery_task = tokio::spawn({
         let pool = pool.clone();
         let ack_conn = ack_conn.clone();
         let consumer_name = consumer_name.to_owned();
+        let retry_config = retry_config.clone();
         let token = recovery_shutdown.clone();
 
         async move {
@@ -225,6 +269,7 @@ async fn run_worker(
                             min_idle_ms,
                             max_in_flight,
                             fail_before_ack,
+                            &retry_config,
                         ).await {
                             Ok(report) => {
                                 if report.claimed > 0 || report.failed > 0 || report.deleted > 0 {
@@ -240,6 +285,12 @@ async fn run_worker(
             }
         }
     });
+
+    let retry_task = tokio::spawn(run_retry_scheduler(
+        client.clone(),
+        retry_config.clone(),
+        retry_shutdown.clone(),
+    ));
 
     let options = StreamReadOptions::default()
         .group(GROUP, consumer_name)
@@ -277,6 +328,7 @@ async fn run_worker(
                         stream.ids,
                         max_in_flight,
                         fail_before_ack,
+                        retry_config,
                     ).await {
                         Ok(report) => info!(
                             stream = %stream.key,
@@ -293,10 +345,68 @@ async fn run_worker(
     };
 
     recovery_shutdown.cancel();
+    retry_shutdown.cancel();
 
     if let Err(join_error) = recovery_task.await {
         warn!(error = %join_error, "recovery task did not exit cleanly");
     }
+    if let Err(join_error) = retry_task.await {
+        warn!(error = %join_error, "retry scheduler task did not exit cleanly");
+    }
 
     run_result
+}
+
+async fn run_retry_scheduler(
+    client: redis::Client,
+    retry_config: RetryConfig,
+    shutdown: CancellationToken,
+) {
+    while !shutdown.is_cancelled() {
+        let mut conn = match client.get_multiplexed_async_connection().await {
+            Ok(conn) => conn,
+            Err(error) => {
+                warn!(error = %error, "retry scheduler could not connect to Redis");
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                }
+            }
+        };
+
+        let mut ticker = tokio::time::interval(retry_config.scheduler_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+
+        let mut reconnect = false;
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+
+            match retry::publish_due_retries(&mut conn, STREAM, &retry_config).await {
+                Ok(published) if published > 0 => {
+                    info!(published, "due retry messages republished to source Stream");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "retry scheduler operation failed; reconnecting"
+                    );
+                    reconnect = true;
+                    break;
+                }
+            }
+        }
+
+        if reconnect {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+        }
+    }
 }
