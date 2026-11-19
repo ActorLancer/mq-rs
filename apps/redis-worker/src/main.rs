@@ -9,13 +9,12 @@ use redis::{
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{env, time::Duration};
-use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    processor::{process_batch, STREAM, GROUP},
+    processor::{process_batch, GROUP, STREAM},
     recovery::recover_pending,
 };
 
@@ -177,8 +176,6 @@ async fn run_worker(
     fail_before_ack: bool,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
-    // BLOCK reads get a dedicated connection. Recovery and ACK commands use
-    // separate multiplexed connections so a blocked read never stalls them.
     let mut read_conn = client
         .get_multiplexed_async_connection()
         .await
@@ -194,7 +191,6 @@ async fn run_worker(
 
     ensure_group(&mut read_conn).await?;
 
-    // Recover old Pending messages once on startup, then periodically.
     let startup_report = recover_pending(
         &mut recovery_conn,
         pool,
@@ -205,18 +201,55 @@ async fn run_worker(
         fail_before_ack,
     )
     .await?;
-    info!(?startup_report, "startup pending recovery completed");
+    info!(?startup_report, "startup Pending recovery completed");
+
+    // Recovery is an independent task with its own connection. It does not
+    // cancel or reissue the long-blocking XREADGROUP operation.
+    let recovery_shutdown = shutdown.child_token();
+    let recovery_task = tokio::spawn({
+        let pool = pool.clone();
+        let ack_conn = ack_conn.clone();
+        let consumer_name = consumer_name.to_owned();
+        let token = recovery_shutdown.clone();
+
+        async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(recovery_interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match recover_pending(
+                            &mut recovery_conn,
+                            &pool,
+                            &ack_conn,
+                            &consumer_name,
+                            min_idle_ms,
+                            max_in_flight,
+                            fail_before_ack,
+                        ).await {
+                            Ok(report) => {
+                                if report.claimed > 0 || report.failed > 0 || report.deleted > 0 {
+                                    info!(?report, "periodic Pending recovery completed");
+                                }
+                            }
+                            Err(error) => {
+                                error!(error = %error, "periodic Pending recovery failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     let options = StreamReadOptions::default()
         .group(GROUP, consumer_name)
         .count(READ_BATCH_SIZE)
         .block(READ_BLOCK_MS);
-
-    let mut recovery_tick = interval(Duration::from_secs(recovery_interval_secs));
-    recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // The first interval tick is immediate; consume it because startup recovery
-    // has already been performed above.
-    recovery_tick.tick().await;
 
     info!(
         consumer = %consumer_name,
@@ -225,57 +258,50 @@ async fn run_worker(
         "worker started"
     );
 
-    loop {
+    let run_result: anyhow::Result<()> = 'worker: loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
                 info!(consumer = %consumer_name, "shutdown requested");
-                break;
-            }
-
-            _ = recovery_tick.tick() => {
-                let report = recover_pending(
-                    &mut recovery_conn,
-                    pool,
-                    &ack_conn,
-                    consumer_name,
-                    min_idle_ms,
-                    max_in_flight,
-                    fail_before_ack,
-                )
-                .await?;
-
-                if report.claimed > 0 || report.failed > 0 || report.deleted > 0 {
-                    info!(?report, "periodic pending recovery completed");
-                }
+                break Ok(());
             }
 
             result = read_conn.xread_options(&[STREAM], &[">"], &options) => {
-                let reply: Option<StreamReadReply> =
-                    result.context("XREADGROUP failed")?;
+                let reply: Option<StreamReadReply> = match result {
+                    Ok(reply) => reply,
+                    Err(error) => break Err(error).context("XREADGROUP failed"),
+                };
 
                 let Some(reply) = reply else {
                     continue;
                 };
 
                 for stream in reply.keys {
-                    let report = process_batch(
+                    match process_batch(
                         pool,
                         &ack_conn,
                         stream.ids,
                         max_in_flight,
                         fail_before_ack,
-                    )
-                    .await?;
-
-                    info!(
-                        stream = %stream.key,
-                        ?report,
-                        "new-message batch completed"
-                    );
+                    ).await {
+                        Ok(report) => info!(
+                            stream = %stream.key,
+                            ?report,
+                            "new-message batch completed"
+                        ),
+                        Err(error) => {
+                            break 'worker Err(error).context("new-message batch failed");
+                        }
+                    }
                 }
             }
         }
+    };
+
+    recovery_shutdown.cancel();
+
+    if let Err(join_error) = recovery_task.await {
+        warn!(error = %join_error, "recovery task did not exit cleanly");
     }
 
-    Ok(())
+    run_result
 }

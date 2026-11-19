@@ -15,9 +15,16 @@ pub const STREAM: &str = "orders:events";
 pub const GROUP: &str = "orders-workers";
 const LOGICAL_CONSUMER: &str = "order-payment-projection-v1";
 
+#[derive(Debug)]
+pub struct ProcessResult {
+    pub outcome: ProcessOutcome,
+    pub acknowledged: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct BatchReport {
     pub acknowledged: usize,
+    pub completed: usize,
     pub failed: usize,
     pub task_panicked: usize,
     pub applied: usize,
@@ -48,14 +55,13 @@ fn decode_event(entry: &StreamId) -> Result<EventEnvelope> {
     Ok(event)
 }
 
-/// Execute the database Inbox transaction first and ACK only after it commits.
-/// The fail_before_ack switch reproduces the COMMIT-success / XACK-failure window.
+/// Execute the Inbox transaction first and ACK only after it commits.
 pub async fn process_and_ack(
     pool: &PgPool,
     ack_conn: &mut MultiplexedConnection,
     entry: StreamId,
     fail_before_ack: bool,
-) -> Result<ProcessOutcome> {
+) -> Result<ProcessResult> {
     let stream_id = entry.id.clone();
     let event = decode_event(&entry)?;
 
@@ -89,13 +95,14 @@ pub async fn process_and_ack(
         );
     }
 
-    Ok(outcome)
+    Ok(ProcessResult {
+        outcome,
+        acknowledged: acked == 1,
+    })
 }
 
-/// Process a batch with bounded concurrency. The JoinSet is kept at or below
-/// max_in_flight; this applies backpressure before spawning more tasks.
-/// Each task receives its own cheap clone of the non-blocking multiplexed ACK
-/// connection. The BLOCK reader uses a different connection.
+/// Keep no more than max_in_flight tasks in JoinSet. This bounds both active
+/// work and the number of spawned-but-uncollected tasks.
 pub async fn process_batch(
     pool: &PgPool,
     ack_connection: &MultiplexedConnection,
@@ -107,7 +114,7 @@ pub async fn process_batch(
         bail!("max_in_flight must be greater than zero");
     }
 
-    let mut tasks: JoinSet<(String, Result<ProcessOutcome>)> = JoinSet::new();
+    let mut tasks: JoinSet<(String, Result<ProcessResult>)> = JoinSet::new();
     let mut report = BatchReport::default();
 
     for entry in entries {
@@ -140,7 +147,7 @@ pub async fn process_batch(
 }
 
 async fn collect_one(
-    tasks: &mut JoinSet<(String, Result<ProcessOutcome>)>,
+    tasks: &mut JoinSet<(String, Result<ProcessResult>)>,
     report: &mut BatchReport,
 ) {
     let Some(joined) = tasks.join_next().await else {
@@ -148,10 +155,13 @@ async fn collect_one(
     };
 
     match joined {
-        Ok((stream_id, Ok(outcome))) => {
-            report.acknowledged += 1;
+        Ok((stream_id, Ok(result))) => {
+            report.completed += 1;
+            if result.acknowledged {
+                report.acknowledged += 1;
+            }
 
-            match outcome {
+            match result.outcome {
                 ProcessOutcome::Applied => report.applied += 1,
                 ProcessOutcome::DuplicateEvent => report.duplicate += 1,
                 ProcessOutcome::AlreadyApplied => report.already_applied += 1,
@@ -159,7 +169,8 @@ async fn collect_one(
 
             info!(
                 stream_id = %stream_id,
-                ?outcome,
+                outcome = ?result.outcome,
+                acknowledged = result.acknowledged,
                 "message processing finished"
             );
         }

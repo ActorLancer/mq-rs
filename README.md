@@ -1,6 +1,6 @@
 # mq-rs
 
-A Rust learning project for reliable asynchronous messaging. The current executable path is Redis Streams + PostgreSQL Inbox; NATS JetStream will be added when that stage is implemented rather than kept as an empty workspace placeholder.
+A Rust learning project for reliable asynchronous messaging. The currently integrated executable path is Redis Streams + PostgreSQL Inbox. NATS JetStream will be introduced in its own stage, rather than keeping an empty NATS worker or unused infrastructure crates in the active workspace.
 
 ## Current workspace
 
@@ -8,17 +8,16 @@ A Rust learning project for reliable asynchronous messaging. The current executa
 - producer: publishes an order.paid event to Redis Streams.
 - redis-worker: reads Consumer Group messages, applies a PostgreSQL Inbox transaction, ACKs after commit, and periodically recovers stale Pending entries with XAUTOCLAIM.
 
-Only implemented crates are workspace members. Empty messaging/infrastructure crates and an empty NATS executable are not kept in the active workspace.
-
 ## Run locally
 
 ```bash
 cp .env.example .env
 docker compose up -d
 cargo check --workspace --all-targets
+cargo test --workspace
 ```
 
-Run database migrations by starting the worker once:
+Run database migrations by starting the worker:
 
 ```bash
 cargo run -p redis-worker
@@ -32,7 +31,7 @@ psql -h 127.0.0.1 -p 65432 -U message_lab -d message_lab \
 cargo run -p producer
 ```
 
-The worker should process the event, commit the Inbox + order update in one PostgreSQL transaction, then issue XACK.
+The worker processes the event, commits the Inbox + order update in one PostgreSQL transaction, and then issues XACK.
 
 ## Fault injection
 
