@@ -88,7 +88,7 @@ pub async fn process_order_paid(
     .bind(&event.aggregate_type)
     .bind(&event.aggregate_id)
     .bind(event.payload.clone())
-    .bind(event.occurred_at.clone())
+    .bind(event.occurred_at)
     .fetch_optional(&mut *tx)
     .await?;
 
