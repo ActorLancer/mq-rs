@@ -1,28 +1,29 @@
-mod inbox;
-mod processor;
-mod recovery;
-
-use anyhow::{Context, anyhow};
-use domain::event::EventEnvelope;
+use anyhow::Context;
 use redis::{
     AsyncCommands,
-    streams::{StreamId, StreamReadOptions, StreamReadReply},
+    streams::{StreamReadOptions, StreamReadReply},
 };
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{env, time::Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-// TODO: 配置到外置的 toml 文件或者环境变量中
-const STREAM: &str = "orders:events";
-const GROUP: &str = "orders-workers";
-const BATCH_SIZE: usize = 10;
-/// 无消息时最大阻塞时间
-const BLOCK_MS: usize = 5_000;
+use redis_worker::{
+    migrate,
+    processor::{GROUP, STREAM, process_batch},
+    recovery::recover_pending,
+};
+
+const READ_BATCH_SIZE: usize = 10;
+const READ_BLOCK_MS: usize = 5_000;
+const DEFAULT_MAX_IN_FLIGHT: usize = 10;
+const DEFAULT_MIN_IDLE_MS: u64 = 60_000;
+const DEFAULT_RECOVERY_INTERVAL_SECS: u64 = 5;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().context("failed to load .env file")?;
+    let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -34,64 +35,119 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let redis_url = env::var("REDIS_URL").context("REDIS_URL is not configured")?;
+    let database_url = env::var("DATABASE_URL").context("DATABASE_URL is not configured")?;
 
-    let client = redis::Client::open(redis_url).context("failed to create Redis client")?;
+    let max_in_flight = parse_env("MAX_IN_FLIGHT", DEFAULT_MAX_IN_FLIGHT)?;
+    let min_idle_ms = parse_env("MIN_IDLE_MS", DEFAULT_MIN_IDLE_MS)?;
+    let recovery_interval_secs =
+        parse_env("RECOVERY_INTERVAL_SECS", DEFAULT_RECOVERY_INTERVAL_SECS)?;
 
-    let database_url = env::var("DATABASE_URL")?;
+    anyhow::ensure!(max_in_flight > 0, "MAX_IN_FLIGHT must be greater than zero");
+    anyhow::ensure!(
+        recovery_interval_secs > 0,
+        "RECOVERY_INTERVAL_SECS must be greater than zero"
+    );
+
+    let fail_before_ack = env::var("FAIL_BEFORE_ACK")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let redis_client = redis::Client::open(redis_url).context("failed to create Redis client")?;
 
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .min_connections(2)
         .connect(&database_url)
-        .await?;
+        .await
+        .context("failed to connect to PostgreSQL")?;
 
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    migrate(&pool)
+        .await
+        .context("failed to run database migrations")?;
 
-    // 每个进程生成唯一消费者名称。
-    // 生产环境还可以将实例 ID、Pod 名称等纳入命名规则
     let consumer_name =
         env::var("CONSUMER_NAME").unwrap_or_else(|_| format!("worker-{}", Uuid::new_v4()));
 
-    // 故障注入开关
-    let fail_before_ack = env::var("FAIL_BEFORE_ACK")
-        .map(|value| value == "true")
-        .unwrap_or(false);
+    let shutdown = CancellationToken::new();
+    let signal_token = shutdown.clone();
 
-    // TODO：升级为指数退避 + Jitter
+    tokio::spawn(async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            error!(error = %error, "failed to listen for Ctrl-C");
+        }
+        signal_token.cancel();
+    });
+
+    info!(
+        consumer = %consumer_name,
+        max_in_flight,
+        min_idle_ms,
+        recovery_interval_secs,
+        fail_before_ack,
+        "redis worker starting"
+    );
+
     loop {
-        match run_worker(&client, &consumer_name, fail_before_ack).await {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        match run_worker(
+            &redis_client,
+            &pool,
+            &consumer_name,
+            max_in_flight,
+            min_idle_ms,
+            recovery_interval_secs,
+            fail_before_ack,
+            &shutdown,
+        )
+        .await
+        {
             Ok(()) => break,
             Err(error) => {
                 error!(
                     error = %error,
-                    "worker stopped unexpectedly; reconnecting in 2 seconds"
+                    "worker stopped unexpectedly; reconnecting"
                 );
 
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
             }
         }
     }
 
+    info!("worker shutting down");
+    pool.close().await;
     Ok(())
 }
 
-/// 判断 Redis 返回的错误信息是否表示消费者组已存在
+fn parse_env<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .with_context(|| format!("invalid value for {name}: {value}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error).with_context(|| format!("failed to read {name}")),
+    }
+}
+
 fn is_group_already_exists(error: &redis::RedisError) -> bool {
     error.to_string().contains("BUSYGROUP")
 }
 
-/// 确保消费者组存在
-///
-/// 使用 0-0 意味着新创建的消费者组从 Stream 起点开始消费。
-/// 使用需要忽略历史消息，值消费之后达到的新消息，可以改成 "$"。
 async fn ensure_group(conn: &mut redis::aio::MultiplexedConnection) -> anyhow::Result<()> {
     let result: redis::RedisResult<String> =
         conn.xgroup_create_mkstream(STREAM, GROUP, "0-0").await;
 
     match result {
-        Ok(_) => {
-            info!(stream = STREAM, group = GROUP, "consumer group created");
-        }
+        Ok(_) => info!(stream = STREAM, group = GROUP, "consumer group created"),
         Err(error) if is_group_already_exists(&error) => {
             info!(
                 stream = STREAM,
@@ -99,151 +155,148 @@ async fn ensure_group(conn: &mut redis::aio::MultiplexedConnection) -> anyhow::R
                 "consumer group already exists"
             );
         }
-        Err(error) => {
-            return Err(error).context("failed to create consumer group");
-        }
+        Err(error) => return Err(error).context("failed to create consumer group"),
     }
 
     Ok(())
 }
 
-/// 从 Stream 消息中解析业务事件
-fn decode_event(entry: &StreamId) -> anyhow::Result<EventEnvelope> {
-    let payload = entry
-        .get::<String>("payload")
-        .ok_or_else(|| anyhow!("message has no field of payload"))?;
-
-    let stored_event_id: String = entry
-        .get("event_id")
-        .ok_or_else(|| anyhow!("message has no field of event_id"))?;
-
-    let event: EventEnvelope =
-        serde_json::from_str(&payload).context("failed to deserialize event payload")?;
-
-    // 检查 Stream 字段和业务事件内部 ID 是否一致
-    if event.event_id.to_string() != stored_event_id {
-        return Err(anyhow!(
-            "event_id mismatch: stream field={}, payload={}",
-            stored_event_id,
-            event.event_id
-        ));
-    }
-
-    Ok(event)
-}
-
-/// 启动一个 Worker
-///
-/// 出现 Redis 网络错误时返回 Err，由外层重新连接
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     client: &redis::Client,
+    pool: &PgPool,
     consumer_name: &str,
+    max_in_flight: usize,
+    min_idle_ms: u64,
+    recovery_interval_secs: u64,
     fail_before_ack: bool,
+    shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
-    // 每个 Worker 使用独立的连接。
-    // 该连接用于 BLOCK 读取，不与其他业务任务共享。
-    let mut conn = client
+    let mut read_conn = client
         .get_multiplexed_async_connection()
         .await
-        .context("failed to connect to Redis")?;
+        .context("failed to open Redis read connection")?;
+    let mut recovery_conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("failed to open Redis recovery connection")?;
+    let ack_conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("failed to open Redis ACK connection")?;
 
-    ensure_group(&mut conn).await?;
+    ensure_group(&mut read_conn).await?;
+
+    let startup_report = recover_pending(
+        &mut recovery_conn,
+        pool,
+        &ack_conn,
+        consumer_name,
+        min_idle_ms,
+        max_in_flight,
+        fail_before_ack,
+    )
+    .await?;
+    info!(?startup_report, "startup Pending recovery completed");
+
+    // Recovery is an independent task with its own connection. It does not
+    // cancel or reissue the long-blocking XREADGROUP operation.
+    let recovery_shutdown = shutdown.child_token();
+    let recovery_task = tokio::spawn({
+        let pool = pool.clone();
+        let ack_conn = ack_conn.clone();
+        let consumer_name = consumer_name.to_owned();
+        let token = recovery_shutdown.clone();
+
+        async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(recovery_interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match recover_pending(
+                            &mut recovery_conn,
+                            &pool,
+                            &ack_conn,
+                            &consumer_name,
+                            min_idle_ms,
+                            max_in_flight,
+                            fail_before_ack,
+                        ).await {
+                            Ok(report) => {
+                                if report.claimed > 0 || report.failed > 0 || report.deleted > 0 {
+                                    info!(?report, "periodic Pending recovery completed");
+                                }
+                            }
+                            Err(error) => {
+                                error!(error = %error, "periodic Pending recovery failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let options = StreamReadOptions::default()
+        .group(GROUP, consumer_name)
+        .count(READ_BATCH_SIZE)
+        .block(READ_BLOCK_MS);
 
     info!(
-        consumer = consumer_name,
+        consumer = %consumer_name,
         stream = STREAM,
         group = GROUP,
         "worker started"
     );
 
-    // 创建消费者读取选项
-    let options = StreamReadOptions::default()
-        .group(GROUP, consumer_name)
-        .count(BATCH_SIZE)
-        .block(BLOCK_MS);
+    let run_result: anyhow::Result<()> = 'worker: loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!(consumer = %consumer_name, "shutdown requested");
+                break Ok(());
+            }
 
-    loop {
-        // > 表示读取消费者组中尚未投递的消息。
-        //
-        // BLOCK 超时且没有消息时，返回 None。
-        let reply: Option<StreamReadReply> = conn
-            .xread_options(&[STREAM], &[">"], &options)
-            .await
-            .context("XREADGROUP failed")?;
-
-        let Some(reply) = reply else {
-            continue;
-        };
-
-        for stream in reply.keys {
-            for entry in stream.ids {
-                let stream_id = entry.id.clone();
-
-                // 解析业务事件
-                let event = match decode_event(&entry) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        error!(
-                            stream_id = %stream_id,
-                            error = %error,
-                            "failed to decode message; leaving it pending"
-                        );
-
-                        // 不能因为解释失败就直接 ACK。
-                        // 当前保留在 PEl，后续实现 DLQ。
-                        continue;
-                    }
+            result = read_conn.xread_options(&[STREAM], &[">"], &options) => {
+                let reply: Option<StreamReadReply> = match result {
+                    Ok(reply) => reply,
+                    Err(error) => break Err(error).context("XREADGROUP failed"),
                 };
 
-                info!(
-                    stream_id = %stream_id,
-                    event_id = %&event.event_id,
-                    event_type = %&event.event_type,
-                    aggregate_id = %&event.aggregate_id,
-                    stream_key = %&stream.key,
-                    "message received"
-                );
-
-                // 模拟业务处理耗时。
-                //
-                // 真实系统中这里可能是：
-                // 1. 查询数据库
-                // 2. 更新订单
-                // 3. 生成授权
-                // 4. 调用下游服务
-                tokio::time::sleep(Duration::from_millis(150)).await;
-
-                // 故障测试模式
-                // 故意不 ACK，观察 PEL
-                if fail_before_ack {
-                    warn!(
-                        stream_id = %stream_id,
-                        event_id = %&event.event_id,
-                        "test mode: leaving message pending"
-                    );
-
+                let Some(reply) = reply else {
                     continue;
-                }
+                };
 
-                // 只有业务处理成功才 ACK
-                let id = [stream_id.as_str()];
-
-                let acked: i64 = conn.xack(STREAM, GROUP, &id).await.context("XACK failed")?;
-
-                if acked == 1 {
-                    info!(
-                        stream_id = %stream_id,
-                        event_id = %event.event_id,
-                        "message acknowledged"
-                    );
-                } else {
-                    warn!(
-                        stream_id = %stream_id,
-                        event_id = %&event.event_id,
-                        "message was not acknowledged"
-                    );
+                for stream in reply.keys {
+                    match process_batch(
+                        pool,
+                        &ack_conn,
+                        stream.ids,
+                        max_in_flight,
+                        fail_before_ack,
+                    ).await {
+                        Ok(report) => info!(
+                            stream = %stream.key,
+                            ?report,
+                            "new-message batch completed"
+                        ),
+                        Err(error) => {
+                            break 'worker Err(error).context("new-message batch failed");
+                        }
+                    }
                 }
             }
         }
+    };
+
+    recovery_shutdown.cancel();
+
+    if let Err(join_error) = recovery_task.await {
+        warn!(error = %join_error, "recovery task did not exit cleanly");
     }
+
+    run_result
 }
