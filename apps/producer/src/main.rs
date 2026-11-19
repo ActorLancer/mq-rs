@@ -15,11 +15,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let redis_url =
-        std::env::var("REDIS_URL").context("REDIS_URL is not configured")?;
+    let redis_url = std::env::var("REDIS_URL").context("REDIS_URL is not configured")?;
 
-    let redis_client =
-        redis::Client::open(redis_url).context("failed to create Redis client")?;
+    let redis_client = redis::Client::open(redis_url).context("failed to create Redis client")?;
 
     let mut conn = redis_client
         .get_multiplexed_async_connection()

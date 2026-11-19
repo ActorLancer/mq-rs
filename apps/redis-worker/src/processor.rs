@@ -1,10 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use domain::event::EventEnvelope;
-use redis::{
-    AsyncCommands,
-    aio::MultiplexedConnection,
-    streams::StreamId,
-};
+use redis::{AsyncCommands, aio::MultiplexedConnection, streams::StreamId};
 use sqlx::PgPool;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -127,13 +123,7 @@ pub async fn process_batch(
         let mut ack_conn = ack_connection.clone();
 
         tasks.spawn(async move {
-            let result = process_and_ack(
-                &pool,
-                &mut ack_conn,
-                entry,
-                fail_before_ack,
-            )
-            .await;
+            let result = process_and_ack(&pool, &mut ack_conn, entry, fail_before_ack).await;
 
             (stream_id, result)
         });

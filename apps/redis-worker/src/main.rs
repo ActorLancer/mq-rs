@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    processor::{process_batch, GROUP, STREAM},
+    processor::{GROUP, STREAM, process_batch},
     recovery::recover_pending,
 };
 
@@ -38,8 +38,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let redis_url = env::var("REDIS_URL").context("REDIS_URL is not configured")?;
-    let database_url =
-        env::var("DATABASE_URL").context("DATABASE_URL is not configured")?;
+    let database_url = env::var("DATABASE_URL").context("DATABASE_URL is not configured")?;
 
     let max_in_flight = parse_env("MAX_IN_FLIGHT", DEFAULT_MAX_IN_FLIGHT)?;
     let min_idle_ms = parse_env("MIN_IDLE_MS", DEFAULT_MIN_IDLE_MS)?;
@@ -56,8 +55,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|value| value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let redis_client =
-        redis::Client::open(redis_url).context("failed to create Redis client")?;
+    let redis_client = redis::Client::open(redis_url).context("failed to create Redis client")?;
 
     let pool = PgPoolOptions::new()
         .max_connections(20)
@@ -71,8 +69,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to run database migrations")?;
 
-    let consumer_name = env::var("CONSUMER_NAME")
-        .unwrap_or_else(|_| format!("worker-{}", Uuid::new_v4()));
+    let consumer_name =
+        env::var("CONSUMER_NAME").unwrap_or_else(|_| format!("worker-{}", Uuid::new_v4()));
 
     let shutdown = CancellationToken::new();
     let signal_token = shutdown.clone();
@@ -148,16 +146,18 @@ fn is_group_already_exists(error: &redis::RedisError) -> bool {
     error.to_string().contains("BUSYGROUP")
 }
 
-async fn ensure_group(
-    conn: &mut redis::aio::MultiplexedConnection,
-) -> anyhow::Result<()> {
+async fn ensure_group(conn: &mut redis::aio::MultiplexedConnection) -> anyhow::Result<()> {
     let result: redis::RedisResult<String> =
         conn.xgroup_create_mkstream(STREAM, GROUP, "0-0").await;
 
     match result {
         Ok(_) => info!(stream = STREAM, group = GROUP, "consumer group created"),
         Err(error) if is_group_already_exists(&error) => {
-            info!(stream = STREAM, group = GROUP, "consumer group already exists");
+            info!(
+                stream = STREAM,
+                group = GROUP,
+                "consumer group already exists"
+            );
         }
         Err(error) => return Err(error).context("failed to create consumer group"),
     }
@@ -213,8 +213,7 @@ async fn run_worker(
         let token = recovery_shutdown.clone();
 
         async move {
-            let mut ticker =
-                tokio::time::interval(Duration::from_secs(recovery_interval_secs));
+            let mut ticker = tokio::time::interval(Duration::from_secs(recovery_interval_secs));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await;
 

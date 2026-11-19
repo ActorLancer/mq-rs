@@ -33,12 +33,14 @@ pub async fn process_order_paid(
     }
 
     if event.schema_version != 1 {
-        bail!("unsupported order.paid schema version: {}", event.schema_version);
+        bail!(
+            "unsupported order.paid schema version: {}",
+            event.schema_version
+        );
     }
 
     let payload: OrderPaidPayload =
-        serde_json::from_value(event.payload.clone())
-            .context("invalid order.paid payload")?;
+        serde_json::from_value(event.payload.clone()).context("invalid order.paid payload")?;
 
     if payload.order_id <= 0 {
         bail!("invalid order_id");
@@ -50,13 +52,14 @@ pub async fn process_order_paid(
         bail!("invalid amount_cents");
     }
     if payload.currency.len() != 3
-        || !payload.currency.bytes().all(|byte| byte.is_ascii_uppercase())
+        || !payload
+            .currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase())
     {
         bail!("currency must be a three-letter uppercase code");
     }
-    if event.aggregate_type != "order"
-        || event.aggregate_id != payload.order_id.to_string()
-    {
+    if event.aggregate_type != "order" || event.aggregate_id != payload.order_id.to_string() {
         bail!("event aggregate does not match order.paid payload");
     }
 
