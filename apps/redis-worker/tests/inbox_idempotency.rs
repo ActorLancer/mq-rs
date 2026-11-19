@@ -6,7 +6,8 @@ use std::env;
 use uuid::Uuid;
 
 async fn test_pool() -> PgPool {
-    let _ = dotenvy::dotenv();
+    let workspace_env = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env");
+    let _ = dotenvy::from_path(workspace_env);
 
     let database_url = env::var("DATABASE_URL")
         .expect("DATABASE_URL must point to a disposable PostgreSQL test database");
