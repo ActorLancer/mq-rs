@@ -1,5 +1,9 @@
 use anyhow::Context;
-use redis::{AsyncCommands, aio::MultiplexedConnection, streams::StreamAutoClaimOptions};
+use redis::{
+    AsyncCommands,
+    aio::MultiplexedConnection,
+    streams::{StreamAutoClaimOptions, StreamAutoClaimReply},
+};
 use sqlx::PgPool;
 use tracing::warn;
 
@@ -32,7 +36,7 @@ pub async fn recover_pending(
     loop {
         let options = StreamAutoClaimOptions::default().count(100);
 
-        let reply = claim_conn
+        let reply: StreamAutoClaimReply = claim_conn
             .xautoclaim_options(STREAM, GROUP, consumer_name, min_idle_ms, &cursor, options)
             .await
             .context("XAUTOCLAIM failed")?;
