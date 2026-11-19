@@ -7,7 +7,10 @@ use redis::{
 use sqlx::PgPool;
 use tracing::warn;
 
-use crate::processor::{BatchReport, GROUP, STREAM, process_batch};
+use crate::{
+    processor::{BatchReport, GROUP, STREAM, process_batch},
+    retry::RetryConfig,
+};
 
 #[derive(Debug, Default)]
 pub struct RecoveryReport {
@@ -16,11 +19,13 @@ pub struct RecoveryReport {
     pub deleted: usize,
     pub failed: usize,
     pub acknowledged: usize,
+    pub retry_scheduled: usize,
+    pub dead_lettered: usize,
 }
 
 /// Scan the whole PEL using Redis' returned cursor. Claimed messages go
-/// through the exact same Inbox -> business transaction -> XACK path as new
-/// messages; recovery must not be a logging-only side path.
+/// through the exact same processor -> Inbox/retry/DLQ/ACK path as new
+/// messages; recovery is not a separate business-processing implementation.
 pub async fn recover_pending(
     claim_conn: &mut MultiplexedConnection,
     pool: &PgPool,
@@ -29,6 +34,7 @@ pub async fn recover_pending(
     min_idle_ms: u64,
     max_in_flight: usize,
     fail_before_ack: bool,
+    retry_config: &RetryConfig,
 ) -> anyhow::Result<RecoveryReport> {
     let mut cursor = "0-0".to_owned();
     let mut report = RecoveryReport::default();
@@ -61,12 +67,15 @@ pub async fn recover_pending(
                 reply.claimed,
                 max_in_flight,
                 fail_before_ack,
+                retry_config,
             )
             .await
             .context("failed to process claimed Pending messages")?;
 
             report.acknowledged += batch.acknowledged;
             report.failed += batch.failed + batch.task_panicked;
+            report.retry_scheduled += batch.retry_scheduled;
+            report.dead_lettered += batch.dead_lettered;
         }
 
         if next_cursor == "0-0" {

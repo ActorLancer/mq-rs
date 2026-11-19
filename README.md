@@ -6,7 +6,7 @@ A Rust learning project for reliable asynchronous messaging. The currently integ
 
 - `domain`: transport-independent event envelope.
 - `producer`: publishes an `order.paid` event to Redis Streams.
-- `redis-worker`: reads Consumer Group messages, applies a PostgreSQL Inbox transaction, ACKs after commit, and periodically recovers stale Pending entries with `XAUTOCLAIM`.
+- `redis-worker`: reads Consumer Group messages, applies a PostgreSQL Inbox transaction, ACKs after commit, recovers stale Pending entries with `XAUTOCLAIM`, schedules transient failures in a ZSET, and transfers permanent/exhausted failures into a DLQ Stream.
 
 The Redis worker modules are exposed through its library crate and used by the binary and integration tests. Empty messaging/infrastructure crates and the empty NATS executable are not kept in the active workspace.
 
@@ -16,6 +16,7 @@ The Redis worker modules are exposed through its library crate and used by the b
 cp .env.example .env
 docker compose up -d
 cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
@@ -35,7 +36,7 @@ psql -h 127.0.0.1 -p 65432 -U message_lab -d message_lab \
 cargo run -p producer
 ```
 
-The worker processes the event, commits the Inbox + order update in one PostgreSQL transaction, and then issues `XACK`.
+The worker processes the event, commits the Inbox + order update in one PostgreSQL transaction, and then issues `XACK`. The source Stream is `orders:{events}:main`; its retry schedule and DLQ use the same `{events}` Redis Cluster hash tag.
 
 ## Fault injection
 
@@ -53,6 +54,26 @@ Reset the order before publishing a new payment event:
 psql -h 127.0.0.1 -p 65432 -U message_lab -d message_lab \
   -f apps/redis-worker/seeds/dev.sql
 ```
+
+## Retry and DLQ
+
+The worker classifies a failed delivery:
+
+- selected SQLx connection/pool errors and transient SQLSTATEs are retryable;
+- payload validation and business-state errors are permanent by default;
+- retryable failures receive exponential backoff with jitter and a maximum retry count;
+- permanent failures and exhausted retries are transferred into `orders:{events}:dead`.
+
+The retry scheduler reads due members from `orders:{events}:retry` and republishes them into `orders:{events}:main`. Lua scripts perform the source PEL transition, retry scheduling, DLQ transfer, and due retry publication atomically with respect to other Redis commands. Since Redis Lua scripts do not roll back prior writes after a runtime error, scripts preflight key types and the recommended production memory policy is `noeviction`.
+
+Inspect the retry schedule and DLQ:
+
+```bash
+redis-cli -p 16379 ZRANGE 'orders:{events}:retry' 0 -1 WITHSCORES
+redis-cli -p 16379 XRANGE 'orders:{events}:dead' - +
+```
+
+The retry count is an application-level counter stored in the message. It is not the same as Redis' PEL delivery count.
 
 ## Important boundaries
 
