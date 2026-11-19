@@ -1,5 +1,8 @@
 use domain::event::EventEnvelope;
-use redis_worker::{inbox::{ProcessOutcome, process_order_paid}, MIGRATOR};
+use redis_worker::{
+    MIGRATOR,
+    inbox::{ProcessOutcome, process_order_paid},
+};
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::env;
@@ -31,11 +34,7 @@ fn unique_order_id() -> i64 {
     value.max(1)
 }
 
-fn paid_event(
-    order_id: i64,
-    buyer_id: i64,
-    payment_id: Uuid,
-) -> EventEnvelope {
+fn paid_event(order_id: i64, buyer_id: i64, payment_id: Uuid) -> EventEnvelope {
     EventEnvelope::new(
         "order.paid",
         "order",
@@ -104,45 +103,34 @@ async fn inbox_is_idempotent_and_detects_event_id_collisions() {
     // violation. It must not be silently treated as a harmless duplicate.
     let mut collision = event.clone();
     collision.payload["amount_cents"] = json!(99);
-    let collision_result =
-        process_order_paid(&pool, &collision, &consumer_name).await;
+    let collision_result = process_order_paid(&pool, &collision, &consumer_name).await;
     assert!(collision_result.is_err());
 
     // A different event_id for the very same payment must not apply the
     // business transition a second time.
     let same_payment_new_event = paid_event(order_id, buyer_id, payment_id);
-    let already_applied = process_order_paid(
-        &pool,
-        &same_payment_new_event,
-        &consumer_name,
-    )
-    .await
-    .expect("same payment under a new event id should be recognized");
-    assert!(matches!(
-        already_applied,
-        ProcessOutcome::AlreadyApplied
-    ));
+    let already_applied = process_order_paid(&pool, &same_payment_new_event, &consumer_name)
+        .await
+        .expect("same payment under a new event id should be recognized");
+    assert!(matches!(already_applied, ProcessOutcome::AlreadyApplied));
 
     let (status, stored_payment_id, amount): (String, Option<Uuid>, Option<i64>) =
-        sqlx::query_as(
-            "SELECT status, payment_id, paid_amount_cents FROM orders WHERE id = $1",
-        )
-        .bind(order_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read updated order");
+        sqlx::query_as("SELECT status, payment_id, paid_amount_cents FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read updated order");
 
     assert_eq!(status, "PAID");
     assert_eq!(stored_payment_id, Some(payment_id));
     assert_eq!(amount, Some(12_345));
 
-    let inbox_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM inbox_messages WHERE consumer_name = $1",
-    )
-    .bind(&consumer_name)
-    .fetch_one(&pool)
-    .await
-    .expect("count Inbox rows");
+    let inbox_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM inbox_messages WHERE consumer_name = $1")
+            .bind(&consumer_name)
+            .fetch_one(&pool)
+            .await
+            .expect("count Inbox rows");
 
     // The original event and the distinct event_id for the same payment
     // are recorded. The replay and colliding payload create no new row.
