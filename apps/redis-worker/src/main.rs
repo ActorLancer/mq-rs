@@ -1,7 +1,3 @@
-mod inbox;
-mod processor;
-mod recovery;
-
 use anyhow::Context;
 use redis::{
     AsyncCommands,
@@ -13,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{
+use redis_worker::{
+    migrate,
     processor::{GROUP, STREAM, process_batch},
     recovery::recover_pending,
 };
@@ -64,8 +61,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to connect to PostgreSQL")?;
 
-    sqlx::migrate!("./migrations")
-        .run(&pool)
+    migrate(&pool)
         .await
         .context("failed to run database migrations")?;
 

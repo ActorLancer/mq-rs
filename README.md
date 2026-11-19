@@ -4,9 +4,11 @@ A Rust learning project for reliable asynchronous messaging. The currently integ
 
 ## Current workspace
 
-- domain: transport-independent event envelope.
-- producer: publishes an order.paid event to Redis Streams.
-- redis-worker: reads Consumer Group messages, applies a PostgreSQL Inbox transaction, ACKs after commit, and periodically recovers stale Pending entries with XAUTOCLAIM.
+- `domain`: transport-independent event envelope.
+- `producer`: publishes an `order.paid` event to Redis Streams.
+- `redis-worker`: reads Consumer Group messages, applies a PostgreSQL Inbox transaction, ACKs after commit, and periodically recovers stale Pending entries with `XAUTOCLAIM`.
+
+The Redis worker modules are exposed through its library crate and used by the binary and integration tests. Empty messaging/infrastructure crates and the empty NATS executable are not kept in the active workspace.
 
 ## Run locally
 
@@ -17,7 +19,9 @@ cargo check --workspace --all-targets
 cargo test --workspace
 ```
 
-Run database migrations by starting the worker:
+The integration tests use `DATABASE_URL` and run the embedded migrations. They create isolated order IDs and logical consumer names, then clean up their rows. Use a disposable development/test database.
+
+Run database migrations and start the worker:
 
 ```bash
 cargo run -p redis-worker
@@ -31,7 +35,7 @@ psql -h 127.0.0.1 -p 65432 -U message_lab -d message_lab \
 cargo run -p producer
 ```
 
-The worker processes the event, commits the Inbox + order update in one PostgreSQL transaction, and then issues XACK.
+The worker processes the event, commits the Inbox + order update in one PostgreSQL transaction, and then issues `XACK`.
 
 ## Fault injection
 
@@ -41,7 +45,7 @@ To reproduce the database-commit / Redis-ACK failure window:
 FAIL_BEFORE_ACK=true MIN_IDLE_MS=10000 cargo run -p redis-worker
 ```
 
-The worker commits PostgreSQL, deliberately skips XACK, and leaves the Redis entry Pending. A recovery scan can later claim it. The Inbox unique key (consumer_name, event_id) makes the replay a duplicate, so the business update is not applied twice.
+The worker commits PostgreSQL, deliberately skips `XACK`, and leaves the Redis entry Pending. A recovery scan can later claim it. The Inbox unique key `(consumer_name, event_id)` makes the replay a duplicate, so the business update is not applied twice.
 
 Reset the order before publishing a new payment event:
 
@@ -52,8 +56,8 @@ psql -h 127.0.0.1 -p 65432 -U message_lab -d message_lab \
 
 ## Important boundaries
 
-- Redis Stream ID identifies a transport entry; event_id identifies the business event.
+- Redis Stream ID identifies a transport entry; `event_id` identifies the business event.
 - Inbox and database side effects share one PostgreSQL transaction.
-- Redis XACK happens only after that transaction commits.
-- XAUTOCLAIM changes PEL ownership; it does not stop an old worker task. Database idempotency is still required.
+- Redis `XACK` happens only after that transaction commits.
+- `XAUTOCLAIM` changes PEL ownership; it does not stop an old worker task. Database idempotency is still required.
 - This stage handles database side effects. External side effects must be emitted through an Outbox, not executed inside the Inbox transaction.
